@@ -48,13 +48,13 @@ flowchart LR
 
 Key design decisions:
 
-- **Delta-based detection, not absolute thresholds.** A label with 50K stable values is fine. A label that grew by 100 in the last epoch is a problem. The processor tracks growth rate using dual-epoch HyperLogLog++ sketches, so legitimate high-cardinality metrics aren't penalized.
+- **Delta-based detection, not absolute thresholds.** A label with 50K stable values is fine. A label that grew by 100 in the last epoch is a problem. Each tracker keeps one cumulative HyperLogLog++ sketch and compares its estimate against the value at the last epoch boundary, so the delta is the number of unique values *added* during the epoch — a growth rate. Legitimate high-cardinality metrics that have stopped growing produce a delta near zero and aren't penalized.
 
 - **256-way sharding.** Each shard has its own `RWMutex`. With 50 concurrent goroutines across 256 shards, average occupancy is ~0.4 per shard. Contention is near zero. Shard selection is `hash & 0xFF` — one CPU cycle.
 
-- **HLL++ with ~2KB per tracker.** Each sketch estimates cardinality regardless of whether 100 or 100M unique values have been observed. 1-2% accuracy. The `axiomhq/hyperloglog` library's `InsertHash(uint64)` path avoids allocation on the hot path.
+- **One HLL++ sketch per tracker.** Accuracy is ~1% whether 100 or 100M unique values have been observed. Size is not fixed: the sketch starts sparse (~1KB at 100 values, ~3KB at 1,000) and converts to a dense ~16KB representation at roughly 8,000 unique values, where it then plateaus. Budget ~16KB per tracker whose label has actually exploded, and set `max_tracker_count` accordingly — it defaults to unlimited. The `axiomhq/hyperloglog` library's `InsertHash(uint64)` path avoids allocation on the hot path.
 
-- **Stale eviction.** Trackers that haven't been seen for two epochs are cleaned up. Memory stays bounded.
+- **Stale eviction.** Trackers that receive no data points for two consecutive epochs are cleaned up. A tracker seeing steady traffic is never idle and so is never evicted, so set `max_tracker_count` to bound worst-case memory — it defaults to unlimited.
 
 ## Comparison with existing processors
 
@@ -66,7 +66,7 @@ Key design decisions:
 | Tag-only mode | Yes | No | No |
 | Per-metric overrides | Yes | N/A | N/A |
 | Top-N offender reporting | Yes | No | No |
-| Memory per tracker | ~2KB (HLL++) | N/A | N/A |
+| Memory per tracker | ~1KB sparse → ~16KB dense (HLL++) | N/A | N/A |
 
 `filterprocessor` and `metricstransformprocessor` are configuration-driven: you tell them what to drop. This processor is data-driven: it figures out what to drop based on observed behavior. The use cases are complementary, not competing.
 

@@ -623,14 +623,14 @@ func TestCardinalityProcessor_EpochRotation(t *testing.T) {
 	shard.mu.RUnlock()
 
 	require.NotNil(t, tracker)
-	require.NotNil(t, tracker.current)
+	require.NotNil(t, tracker.lifetime)
 
 	// Manually trigger a rotation to hit the coverage branch
 	p.rotate()
 
-	// Re-lock to check the flip occurred safely
+	// The cumulative sketch survives rotation — it is the delta's baseline.
 	shard.mu.RLock()
-	require.NotNil(t, tracker.previous)
+	require.NotNil(t, tracker.lifetime)
 	shard.mu.RUnlock()
 }
 
@@ -802,7 +802,7 @@ func TestCollectShardDeltas_Disabled(t *testing.T) {
 	entries[0].t.cachedCurr = 100
 	entries[0].t.cachedPrev = 0
 
-	result := collectShardDeltas(entries, nil, 0)
+	result := collectShardDeltas(entries, []uint64{100}, nil, 0)
 	assert.Nil(t, result, "collectShardDeltas must return nil when topN=0")
 }
 
@@ -1561,7 +1561,7 @@ func TestShouldDrop_NonStringAttributeTypes(t *testing.T) {
 		require.True(t, ok, "tracker for %s should exist", metricName)
 		// Two distinct values → HLL estimate must be ≥ 2.
 		tr.mu.Lock()
-		est := tr.current.Estimate()
+		est := tr.lifetime.Estimate()
 		tr.mu.Unlock()
 		assert.GreaterOrEqual(t, est, uint64(2),
 			"tracker for %s should record 2 unique values, got %d", metricName, est)

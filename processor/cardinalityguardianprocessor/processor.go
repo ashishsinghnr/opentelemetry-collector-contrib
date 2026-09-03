@@ -25,7 +25,7 @@ import (
 
 // staleSweepEpochs is how many consecutive zero-insert epochs a tracker must
 // see before eviction. Two epochs so a tracker that fired at the tail of one
-// epoch (and is rotated into "previous") isn't reaped before traffic resumes.
+// epoch isn't reaped before traffic resumes.
 const staleSweepEpochs = 2
 
 // numShards must be a power of two so getShard reduces to a bitmask AND.
@@ -38,9 +38,11 @@ const numShards = 256
 // "the whole datapoint was marked overflow".
 const overflowSentinel = "otel.cardinality_overflow"
 
-// mustGetSketch returns a fresh HLL++ sketch (p=14 → ~0.81% standard error,
-// ~12 KB in dense mode). Allocated directly because hyperloglog.Sketch lacks
-// a safe Reset(), so pooling dirty sketches would corrupt estimates.
+// mustGetSketch returns a fresh HLL++ sketch (p=14 → ~0.81% standard error).
+// The sketch starts sparse and grows with observed cardinality, converting to a
+// dense ~16 KB representation at roughly 8k unique values; it is not a
+// fixed-size allocation. Allocated directly because hyperloglog.Sketch lacks a
+// safe Reset(), so pooling dirty sketches would corrupt estimates.
 func mustGetSketch() *hyperloglog.Sketch {
 	return hyperloglog.New14()
 }
@@ -54,73 +56,97 @@ type trackerKey struct {
 	attrKey    string
 }
 
-// estimateInterval is how often Sketch.Estimate() is recomputed in the hot
-// path. Estimate() allocates ~5 heap objects per call in sparse mode; running
-// it every 64 inserts amortizes that to ~0.08 allocs/op. Power-of-two ⇒
-// bitmask check. The two-phase strategy in tracker.insert keeps the estimate
-// accurate while the sketch grows through the configured limit.
+// estimateInterval is how often Sketch.Estimate() is recomputed once a sketch is
+// large enough that the call is expensive. Power-of-two ⇒ bitmask check.
 const estimateInterval = 64
 
-// tracker holds two HLL++ sketches for a (metric_name, label_key) pair plus
-// a fine-grained mutex so the shard-level lock can be released before HLL
-// work begins. Hot fields are at the front for cache-line locality.
+// denseThreshold is the estimate above which Sketch.Estimate() is assumed to have
+// switched to its dense representation. Measured against axiomhq/hyperloglog at
+// p=14, the call stays under 400ns below ~7500 unique values and jumps to ~100µs
+// by 8000, so tracker.insert stops refreshing on every insert above this bound.
+const denseThreshold = 1 << 13
+
+// tracker holds one HLL++ sketch for a (metric_name, label_key) pair plus a
+// fine-grained mutex so the shard-level lock can be released before HLL work
+// begins. Hot fields are at the front for cache-line locality.
 type tracker struct {
-	mu       sync.Mutex
-	current  *hyperloglog.Sketch
-	previous *hyperloglog.Sketch
-	// cachedCurr/cachedPrev: see two-phase strategy in insert(). cachedPrev
-	// is only updated in rotate().
-	cachedCurr  uint64
-	cachedPrev  uint64
+	mu sync.Mutex
+	// lifetime accumulates every value ever seen for this pair and is never
+	// reset, so cachedCurr is cumulative and the delta against cachedPrev is the
+	// number of unique values added during the epoch that just ended — a rate.
+	// Two per-epoch sketches would instead give the change in rate, which is
+	// zero under constant growth and hides sustained leaks.
+	lifetime *hyperloglog.Sketch
+	// cachedCurr is the cumulative estimate; cachedPrev is its value at the last
+	// rotation. Their difference is the epoch delta.
+	cachedCurr uint64
+	cachedPrev uint64
+	// insertCount resets each epoch; it drives idle detection and the refresh
+	// interval in insert().
 	insertCount uint64
 	// idleEpochs counts consecutive zero-insert rotations; eviction at staleSweepEpochs.
 	idleEpochs int
 }
 
-// insert feeds a pre-hashed value into the current sketch via InsertHash —
+// insert feeds a pre-hashed value into the cumulative sketch via InsertHash —
 // the []byte path would escape to the heap because the library's `hash`
 // indirection blocks escape analysis.
 //
-// Two-phase estimate refresh: while insertCount ≤ estimateInterval, refresh
-// on every insert so the limit can't be overshot by up to estimateInterval
-// elements before drops activate. After that, refresh every estimateInterval
-// inserts (bitmask check). cachedPrev is only updated in rotate().
-func (t *tracker) insert(hashVal uint64) (curr, prev uint64) {
+// Estimate is refreshed every estimateInterval inserts, plus on every insert
+// while the epoch's delta is still within estimateInterval of the limit. The
+// second condition is what makes enforcement exact: it only holds in the narrow
+// band just below a breach, so the extra calls are bounded, and without it a
+// stale estimate would let up to estimateInterval-1 values through.
+//
+// The band is skipped once the sketch is past denseThreshold, where Estimate
+// costs ~100µs instead of ~100ns. A label that large has already breached any
+// usable limit by orders of magnitude, so per-insert precision buys nothing.
+func (t *tracker) insert(hashVal, limit uint64) (curr, prev uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.current.InsertHash(hashVal)
+	t.lifetime.InsertHash(hashVal)
 	t.insertCount++
-	if t.insertCount <= estimateInterval || t.insertCount&(estimateInterval-1) == 0 {
-		t.cachedCurr = t.current.Estimate()
+
+	nearLimit := t.cachedCurr < denseThreshold &&
+		t.cachedCurr+estimateInterval >= t.cachedPrev+limit
+	if nearLimit || t.insertCount&(estimateInterval-1) == 0 {
+		t.cachedCurr = t.lifetime.Estimate()
 	}
 	return t.cachedCurr, t.cachedPrev
 }
 
-// rotate promotes current → previous, installs fresh as the new current, and
-// carries cachedCurr forward as cachedPrev so the new epoch has its baseline
-// without another Estimate() call. Returns true when this tracker received
-// zero inserts during the epoch that just ended.
-func (t *tracker) rotate(fresh *hyperloglog.Sketch) (idle bool) {
+// rotate closes out the epoch, returning its cardinality delta and whether the
+// tracker received no inserts.
+//
+// The estimate is recomputed here rather than trusted from insert(), which skips
+// refreshes between intervals and so can leave cachedCurr stale at an arbitrary
+// epoch boundary. This is the only place the delta is computed, so enforcement
+// and the top-offenders gauge cannot disagree.
+func (t *tracker) rotate() (delta uint64, idle bool) {
 	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	idle = t.insertCount == 0
 	if idle {
 		t.idleEpochs++
 	} else {
 		t.idleEpochs = 0
+		t.cachedCurr = t.lifetime.Estimate()
+	}
+
+	// cachedCurr is cumulative and must carry across the boundary; zeroing it
+	// would make the next epoch's delta the full lifetime count.
+	if t.cachedCurr > t.cachedPrev {
+		delta = t.cachedCurr - t.cachedPrev
 	}
 	t.cachedPrev = t.cachedCurr
-	t.cachedCurr = 0
 	t.insertCount = 0
-	t.previous = t.current
-	t.current = fresh
-	t.mu.Unlock()
-	return idle
+	return delta, idle
 }
 
 func newTracker() *tracker {
 	return &tracker{
-		current:  mustGetSketch(),
-		previous: mustGetSketch(),
+		lifetime: mustGetSketch(),
 	}
 }
 
@@ -519,16 +545,13 @@ func (p *cardinalityProcessor) isProtected(key string) bool {
 // rotate advances the sliding cardinality window by one epoch across all
 // shards. It runs on the background ticker goroutine, never on the hot path.
 //
-// Per shard: snapshot tracker pointers under a brief RLock, release, allocate
-// fresh sketches outside any lock, then call tracker.rotate on each — which
-// takes only the fine-grained per-tracker mutex. The shard-level write lock
-// is never held during sketch allocation.
+// Per shard: snapshot tracker pointers under a brief RLock, release, then call
+// tracker.rotate on each — which takes only the fine-grained per-tracker mutex.
+// The shard-level write lock is taken only to evict stale trackers.
 func (p *cardinalityProcessor) rotate() {
 	p.logger.Debug("Rotating cardinality sketches")
 
-	// allDeltas collects the pre-rotation delta for every active tracker
-	// across all shards. It is populated before rotation resets the
-	// cached estimates, then sorted to extract the Top-N offenders.
+	// topBuf holds the highest-delta trackers across all shards, bounded to topN.
 	topN := p.config.TopOffendersCount
 	var topBuf []offenderEntry
 	if topN > 0 {
@@ -548,26 +571,20 @@ func (p *cardinalityProcessor) rotate() {
 		}
 		shard.mu.RUnlock()
 
-		// Snapshot deltas before rotation resets the cached estimates.
-		topBuf = collectShardDeltas(entries, topBuf, topN)
-
-		// Pull fresh sketches from the pool entirely outside any lock.
-		fresh := make([]*hyperloglog.Sketch, len(entries))
-		for i := range entries {
-			fresh[i] = mustGetSketch()
-		}
-
-		// Rotate each tracker under its own fine-grained per-tracker lock,
-		// not the shard lock, so ConsumeMetrics is never blocked here.
-		// Collect keys of trackers that have been idle for staleSweepEpochs
-		// consecutive rotations.
+		// Rotate under each tracker's own lock, not the shard lock, so
+		// ConsumeMetrics is never blocked here. Trackers idle for
+		// staleSweepEpochs consecutive rotations are collected for eviction.
 		staleKeys := make([]trackerKey, 0, len(entries))
+		deltas := make([]uint64, len(entries))
 		for i, e := range entries {
-			idle := e.t.rotate(fresh[i])
+			delta, idle := e.t.rotate()
+			deltas[i] = delta
 			if idle && e.t.idleEpochs >= staleSweepEpochs {
 				staleKeys = append(staleKeys, e.key)
 			}
 		}
+
+		topBuf = collectShardDeltas(entries, deltas, topBuf, topN)
 
 		// Evict stale trackers under a write lock. This is rare — only
 		// trackers that received zero inserts for staleSweepEpochs
@@ -607,18 +624,18 @@ func (p *cardinalityProcessor) rotate() {
 // otherwise the candidate replaces the current minimum only if its delta is
 // larger. The min-element index is recomputed via a simple linear scan over
 // the (tiny, typically 10-element) buffer — no heap or sort allocations.
-func collectShardDeltas(entries []trackerEntry, topBuf []offenderEntry, topN int) []offenderEntry {
+//
+// deltas must be parallel to entries and is produced by tracker.rotate, so this
+// function neither locks nor estimates: the gauge and enforcement always agree.
+func collectShardDeltas(entries []trackerEntry, deltas []uint64, topBuf []offenderEntry, topN int) []offenderEntry {
 	if topN <= 0 {
 		return topBuf
 	}
-	for _, e := range entries {
-		e.t.mu.Lock()
-		curr, prev := e.t.cachedCurr, e.t.cachedPrev
-		e.t.mu.Unlock()
-		if curr <= prev {
+	for i, e := range entries {
+		delta := deltas[i]
+		if delta == 0 {
 			continue
 		}
-		delta := curr - prev
 
 		if len(topBuf) < topN {
 			// Buffer not full yet — just append.
@@ -652,19 +669,19 @@ func collectShardDeltas(entries []trackerEntry, topBuf []offenderEntry, topN int
 // publishTopOffenders sorts the bounded top-N buffer by descending delta and
 // stores the result under topOffendersMu for the telemetry callback to read.
 // It also emits an Info-level log line for the single highest offender to aid
-// grep-based debugging. This is a no-op when the buffer is empty.
+// grep-based debugging.
+//
+// An empty buffer is stored rather than skipped: when no label grew this epoch
+// the gauge must clear, or it keeps reporting the last epoch that had growth.
 func (p *cardinalityProcessor) publishTopOffenders(topBuf []offenderEntry) {
-	if len(topBuf) == 0 {
-		return
-	}
-	// Sort the small bounded buffer (typically 10 elements) for deterministic
-	// gauge emission order. This is a single sort of a tiny slice, not the
-	// unbounded sort that the previous implementation used.
 	sortOffenders(topBuf)
 	p.topOffendersMu.Lock()
 	p.topOffenders = topBuf
 	p.topOffendersMu.Unlock()
 
+	if len(topBuf) == 0 {
+		return
+	}
 	p.logger.Info("Top cardinality offender",
 		zap.String("metric", topBuf[0].metricName),
 		zap.String("label", topBuf[0].labelKey),
@@ -792,8 +809,10 @@ func (p *cardinalityProcessor) shouldDrop(metricName, attrKey string, attrVal pc
 	}
 
 	// HLL insert and estimate happen under the per-tracker lock, completely
-	// independent of the shard lock.
-	currCount, prevCount := t.insert(hashVal)
+	// independent of the shard lock. The limit is passed in so insert can refresh
+	// the estimate eagerly as the tracker approaches it.
+	limit := p.getLimit(metricName)
+	currCount, prevCount := t.insert(hashVal, limit)
 
 	// Guard against uint64 underflow caused by HLL probabilistic estimation
 	// variance — if the current count has not grown, nothing should be dropped.
@@ -801,7 +820,7 @@ func (p *cardinalityProcessor) shouldDrop(metricName, attrKey string, attrVal pc
 		return false
 	}
 
-	return (currCount - prevCount) > p.getLimit(metricName)
+	return (currCount - prevCount) > limit
 }
 
 // getLimit returns the per-metric cardinality limit for the given metric name,
