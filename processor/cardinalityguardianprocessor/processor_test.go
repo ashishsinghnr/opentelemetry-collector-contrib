@@ -624,14 +624,17 @@ func TestCardinalityProcessor_EpochRotation(t *testing.T) {
 
 	require.NotNil(t, tracker)
 	require.NotNil(t, tracker.current)
+	before := tracker.current
 
 	// Manually trigger a rotation to hit the coverage branch
 	p.rotate()
 
-	// Re-lock to check the flip occurred safely
-	shard.mu.RLock()
-	require.NotNil(t, tracker.previous)
-	shard.mu.RUnlock()
+	// Rotation installs a fresh per-epoch sketch and records the lifetime
+	// estimate as the next baseline.
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	require.NotSame(t, before, tracker.current)
+	require.Equal(t, uint64(1), tracker.cachedPrev)
 }
 
 // TestTopOffenders verifies that the otelcol_processor_cardinality_top.offenders gauge correctly

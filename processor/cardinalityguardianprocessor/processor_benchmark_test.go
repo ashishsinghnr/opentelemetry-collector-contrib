@@ -233,3 +233,40 @@ func BenchmarkConsumeMetrics_LargeBatch(b *testing.B) {
 		require.NoError(b, proc.ConsumeMetrics(b.Context(), md))
 	}
 }
+
+// BenchmarkShouldDrop_StableSmallLimit measures a stable label under a limit
+// below estimateInterval, rotating once per pass over its values so the refreshes
+// in each epoch's first estimateInterval inserts are included. A sparse and a
+// dense sketch are covered.
+func BenchmarkShouldDrop_StableSmallLimit(b *testing.B) {
+	for _, n := range []int{5000, 20000} {
+		b.Run(fmt.Sprintf("values=%d", n), func(b *testing.B) {
+			cfg := &Config{
+				MaxCardinalityDeltaPerEpoch: 50,
+				EpochDurationSeconds:        300,
+			}
+			set := processortest.NewNopSettings(component.MustNewType("cardinality_guardian"))
+			proc, err := newCardinalityProcessor(b.Context(), cfg, set, new(consumertest.MetricsSink))
+			require.NoError(b, err)
+			p := proc.(*cardinalityProcessor)
+
+			vals := make([]pcommon.Value, n)
+			for i := range vals {
+				vals[i] = pcommon.NewValueStr(fmt.Sprintf("value-%d", i))
+				p.shouldDrop("bench_metric", "bench_key", vals[i])
+			}
+			p.rotate()
+
+			b.ReportAllocs()
+			i := 0
+			for b.Loop() {
+				p.shouldDrop("bench_metric", "bench_key", vals[i])
+				i++
+				if i == n {
+					i = 0
+					p.rotate()
+				}
+			}
+		})
+	}
+}

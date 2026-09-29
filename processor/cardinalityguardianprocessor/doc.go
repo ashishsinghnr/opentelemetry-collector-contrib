@@ -18,12 +18,12 @@
 //
 // # How it works
 //
-// For every (metric_name, label_key) pair the processor keeps two HLL sketches
-// (current and previous epoch). The delta between them estimates how many new
-// unique values the label has acquired this epoch. When that delta exceeds
-// MaxCardinalityDeltaPerEpoch the offending attribute is handled per the
-// configured EnforcementMode (EnforcementTagOnly, EnforcementOverflowAttribute,
-// or EnforcementStripAndReaggregate).
+// For every (metric_name, label_key) pair the processor keeps an HLL sketch of
+// every value seen and records its estimate at each epoch boundary. The growth
+// since that boundary is how many new unique values the label has acquired this
+// epoch. When that delta exceeds MaxCardinalityDeltaPerEpoch the offending
+// attribute is handled per the configured EnforcementMode (EnforcementTagOnly,
+// EnforcementOverflowAttribute, or EnforcementStripAndReaggregate).
 //
 // # Architecture
 //
